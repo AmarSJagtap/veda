@@ -248,7 +248,8 @@ class AIService {
       '4) When using tool outputs, cite the source in square brackets at the end of the response (for example: [source: holdings API]).\n' +
       '5) Keep language natural and concise for voice playback. Pipe tables (| col |) are allowed and encouraged for multi-row data. Avoid code blocks.\n' +
       '6) NEVER refuse a data question without first querying the database. If you have database tools, call query_database directly (the schema is already provided in the prompt) before deciding you cannot answer.\n' +
-      '7) If a query returns 0 rows, investigate by querying DISTINCT values of the filter column to find the correct value, then retry with the correct value. NEVER include intermediate investigation data (like lists of DISTINCT values) in your final response — only include the FINAL answer.\n';
+      '7) If a query returns 0 rows, investigate by querying DISTINCT values of the filter column to find the correct value, then retry with the correct value. NEVER include intermediate investigation data (like lists of DISTINCT values) in your final response — only include the FINAL answer.\n' +
+      '8) NEVER respond with placeholder or thinking text like "Let me check", "Please hold on", "I\'ll retrieve that", "Querying the database now", or similar. Either call the appropriate tool/query immediately, or provide the final answer directly. Your response must always contain the ACTUAL answer with real data — never a promise to find it.\n';
 
     // Build intent context block for the LLM
     const intentContextBlock = intentResult.enrichedContext
