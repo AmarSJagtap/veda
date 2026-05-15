@@ -14,6 +14,8 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const multer = require('multer');
+const { OpenAI } = require('openai');
 
 const { processKnowledgeBase } = require('./services/kb-processor');
 const VectorStore = require('./services/vector-store');
@@ -220,6 +222,67 @@ function tenantAuth(req, res, next) {
 
 // Apply tenant auth to all /api routes
 app.use('/api', tenantAuth);
+
+/* ─── Whisper STT / TTS (OpenAI) ─── */
+
+const _whisperUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+
+function _getOpenAIClient() {
+  const key = process.env.OPENAI_API_KEY || '';
+  if (!key) return null;
+  return new OpenAI({ apiKey: key });
+}
+
+// POST /api/whisper/stt  — audio blob → transcript
+app.post('/api/whisper/stt', _whisperUpload.single('audio'), async (req, res) => {
+  try {
+    const openai = _getOpenAIClient();
+    if (!openai) return res.status(500).json({ error: 'OPENAI_API_KEY not configured on server' });
+
+    if (!req.file) return res.status(400).json({ error: 'No audio file provided' });
+
+    const lang = req.body.lang || 'en';
+    // OpenAI expects a File-like object; use a Buffer with a filename
+    const audioFile = new File([req.file.buffer], 'audio.webm', { type: req.file.mimetype || 'audio/webm' });
+
+    const result = await openai.audio.transcriptions.create({
+      model: 'whisper-1',
+      file: audioFile,
+      language: lang.split('-')[0],   // 'en-IN' → 'en'
+    });
+
+    res.json({ transcript: result.text || '' });
+  } catch (err) {
+    console.error('[Whisper STT] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/whisper/tts  — text → mp3 audio stream
+app.post('/api/whisper/tts', express.json(), async (req, res) => {
+  try {
+    const openai = _getOpenAIClient();
+    if (!openai) return res.status(500).json({ error: 'OPENAI_API_KEY not configured on server' });
+
+    const { text, voice = 'nova' } = req.body;
+    if (!text) return res.status(400).json({ error: 'text is required' });
+
+    const mp3 = await openai.audio.speech.create({
+      model: 'tts-1',
+      voice,
+      input: text,
+      response_format: 'mp3',
+    });
+
+    const buffer = Buffer.from(await mp3.arrayBuffer());
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Content-Length', buffer.length);
+    res.send(buffer);
+  } catch (err) {
+    console.error('[Whisper TTS] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /* ─── Routes ─── */
 

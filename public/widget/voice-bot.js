@@ -36,6 +36,11 @@
     deepgramEnabled: false,     // true → use Deepgram Voice Agent (WS), false → browser SpeechRecognition/TTS
     deepgramApiKey: '',         // Deepgram API key (or leave blank & use server proxy /api/deepgram/token)
     deepgramSettings: null,     // Full Deepgram Settings JSON override (if null, uses built-in defaults)
+
+    /* ── OpenAI Whisper STT + TTS ── */
+    whisperEnabled: false,      // true → use OpenAI Whisper STT + OpenAI TTS via server (requires OPENAI_API_KEY on server)
+    whisperTtsVoice: 'nova',    // OpenAI TTS voice: alloy | echo | fable | onyx | nova | shimmer
+    whisperSilenceMs: 1500,     // ms of silence before speech is auto-submitted
   };
 
   const STATES = {
@@ -2347,7 +2352,6 @@
       this._bargeInRecognition = null; // Separate recognition for barge-in
       this._bargeInActive = false;   // True during barge-in to suppress onSpeakEnd
       this._currentTTSText = '';     // Track what TTS is currently saying (for echo filtering)
-      this._ttsBoundaryIndex = 0;    // Current word char-offset in TTS text (from onboundary)
       this._bargeInReady = false;    // Delay barge-in to avoid TTS echo at start
       this._initRecognition();
       this._pickVoice();             // Pre-select best voice
@@ -2479,10 +2483,6 @@
       this.recognition.continuous = true;
       this.recognition.maxAlternatives = 1;
 
-      this.recognition.onstart = () => {
-        console.log('[SpeechEngine] Recognition started, lang:', this.lang);
-      };
-
       this.recognition.onresult = (e) => {
         let final = '', interim = '';
         for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -2490,7 +2490,6 @@
           if (e.results[i].isFinal) final += transcript;
           else interim += transcript;
         }
-        console.log('[SpeechEngine] Result — interim:', interim, '| final:', final);
         if (interim) this.onInterim(interim);
         if (final) {
           this.onResult(final.trim());
@@ -2499,7 +2498,6 @@
       };
 
       this.recognition.onerror = (e) => {
-        console.warn('[SpeechEngine] Recognition error (all):', e.error);
         if (e.error === 'no-speech' || e.error === 'aborted') return;
         console.warn('[SpeechEngine] Recognition error:', e.error);
 
@@ -2614,34 +2612,22 @@
           }
         }, 3000);
 
-        // Track which word the TTS is currently speaking so the echo filter
-        // uses a sliding window instead of the full response text.
-        this._ttsBoundaryIndex = 0;
-        utterance.onboundary = (e) => {
-          if (e.name === 'word') this._ttsBoundaryIndex = e.charIndex;
-        };
-
         utterance.onstart = () => {
           started = true;
           clearTimeout(safetyTimer);
           this.isSpeaking = true;
           this._currentTTSText = text.toLowerCase();
-          this._ttsBoundaryIndex = 0;
           this.onSpeakStart();
           this._simulateSpeechAudio(text);
-
-          // ── Barge-in during TTS ──
-          // For Hindi: barge-in is completely disabled while the bot is speaking.
-          // The browser's SpeechRecognition receives a raw mic stream that bypasses
-          // all WebAudio processing, so acoustic echo (speaker → mic) cannot be
-          // filtered reliably in software. Any attempt to run recognition concurrently
-          // with Hindi TTS causes the bot to interrupt itself.
-          // The user can still speak immediately after TTS ends via onSpeakEnd → startListening.
+          // Delay barge-in activation to let TTS audio settle and avoid echo false-triggers
+          // Hindi TTS bleeds into mic longer — use a larger delay for non-Latin scripts
           this._bargeInReady = false;
-          if (!this.lang.startsWith('hi')) {
-            this._startBargeInListener();
-            setTimeout(() => { this._bargeInReady = true; }, 800);
-          }
+          const bargeInDelay = this.lang.startsWith('hi') ? 2000 : 800;
+          setTimeout(() => {
+            this._bargeInReady = true;
+          }, bargeInDelay);
+          // Start barge-in listener so user can interrupt by voice
+          this._startBargeInListener();
 
           // ── Chrome keep-alive: prevent Chrome from pausing mid-utterance ──
           // Chrome will pause TTS after ~15 s of continuous speech. Periodically
@@ -2658,7 +2644,6 @@
           clearInterval(this._ttsKeepAlive);
           this.isSpeaking = false;
           this._currentTTSText = '';
-          this._ttsBoundaryIndex = 0;
           this._bargeInReady = false;
           this._stopBargeInListener();
           // Don't fire onSpeakEnd if barge-in already handled the transition
@@ -2678,7 +2663,6 @@
           clearInterval(this._ttsKeepAlive);
           this.isSpeaking = false;
           this._currentTTSText = '';
-          this._ttsBoundaryIndex = 0;
           this._bargeInReady = false;
           this._stopBargeInListener();
           if (this._bargeInActive) {
@@ -2734,6 +2718,8 @@
 
       // Track interim accumulation to detect sustained non-echo speech
       this._bargeInInterimCount = 0;
+      // For Hindi/non-Latin scripts require more hits before triggering (echo harder to detect)
+      this._bargeInInterimThreshold = this.lang.startsWith('hi') ? 3 : 1;
 
       this._bargeInRecognition.onresult = (e) => {
         // Don't trigger until startup delay has passed
@@ -2747,49 +2733,43 @@
           // Ignore empty / very short fragments
           if (transcript.length < 2) continue;
 
-          // ── TTS Echo Filter (sliding window) ──
-          // Compare against a window around the current speaking position rather than
-          // the full TTS text. This avoids:
-          //   • False positives: user saying a word that appears elsewhere in the response
-          //   • False negatives: echo from early TTS no longer in the window
-          const heard = transcript.toLowerCase().replace(/[.,!?;:'"।॥]/g, '').trim();
+          // Require minimum meaningful length (Hindi words are often long)
+          const minLen = this.lang.startsWith('hi') ? 6 : 3;
+          if (transcript.length < minLen) continue;
 
-          if (this._currentTTSText && heard.length > 0) {
-            const fullTTS = this._currentTTSText;
-            const pos = this._ttsBoundaryIndex || 0;
-            // Window: 150 chars before current word (recently spoken) + 40 chars ahead
-            const winStart = Math.max(0, pos - 150);
-            const winEnd   = Math.min(fullTTS.length, pos + 40);
-            const window   = fullTTS.slice(winStart, winEnd)
-                               .replace(/[.,!?;:'"।॥]/g, '').trim();
+          // ── TTS Echo Filter — word-overlap ──
+          // Strip punctuation and normalise for comparison
+          const _norm = (s) => s.toLowerCase().replace(/[.,!?;:'"।॥\-]/g, '').replace(/\s+/g, ' ').trim();
+          const heard = _norm(transcript);
+          const tts   = _norm(this._currentTTSText);
 
-            // Substring check against window
-            if (window.includes(heard)) {
-              console.log(`[BargeIn] Echo (window-substring pos=${pos}): "${transcript}"`);
+          if (tts) {
+            // 1. Exact substring check (fast path — works well for English)
+            if (tts.includes(heard)) {
+              console.log(`[BargeIn] Echo (substring): "${transcript}"`);
+              this._bargeInInterimCount = 0; // reset — don't let TTS echoes accumulate
               continue;
             }
 
-            // Word-overlap check against window — catches Hindi echoes where recognition
-            // produces slightly different conjuncts/characters than the original TTS text.
-            const heardWords  = heard.split(/\s+/).filter(w => w.length > 1);
-            const windowWords = new Set(window.split(/\s+/));
+            // 2. Word-overlap check — reject if ≥60 % of heard words appear in TTS text
+            //    Catches Hindi echoes where transcription form differs slightly
+            const heardWords = heard.split(' ').filter(Boolean);
+            const ttsWords   = new Set(tts.split(' ').filter(Boolean));
             if (heardWords.length > 0) {
-              const overlapCount = heardWords.filter(w => windowWords.has(w)).length;
-              const overlapRatio = overlapCount / heardWords.length;
-              if (overlapRatio >= 0.55) {
-                console.log(`[BargeIn] Echo (word-overlap ${(overlapRatio * 100).toFixed(0)}% pos=${pos}): "${transcript}"`);
+              const overlap = heardWords.filter(w => ttsWords.has(w)).length;
+              const ratio   = overlap / heardWords.length;
+              if (ratio >= 0.6) {
+                console.log(`[BargeIn] Echo (word-overlap ${(ratio * 100).toFixed(0)}%): "${transcript}"`);
+                this._bargeInInterimCount = 0; // reset
                 continue;
               }
             }
           }
 
-          // ── Interim path — trigger on sustained non-echo speech ──
+          // ── Interim path — require _bargeInInterimThreshold consecutive non-echo hits ──
           if (!isFinal) {
             this._bargeInInterimCount++;
-            // For Hindi, require more interim hits before triggering barge-in to reduce
-            // false positives caused by low recognition accuracy and echo pickup.
-            const interimThreshold = this.lang.startsWith('hi') ? 2 : 1;
-            if (this._bargeInInterimCount >= interimThreshold) {
+            if (this._bargeInInterimCount >= this._bargeInInterimThreshold) {
               console.log(`[BargeIn] Interim interrupt (${this._bargeInInterimCount} hits): "${transcript}"`);
               this._executeBargeIn(transcript);
               return;
@@ -2926,16 +2906,11 @@
         if (!this._audioCtx) {
           this._audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         }
-
-        const isHindi = this.lang.startsWith('hi');
-
         this._micStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             noiseSuppression: true,
             echoCancellation: true,
             autoGainControl: true,
-            // suppressLocalAudioPlayback reduces TTS echo leaking back into the mic
-            suppressLocalAudioPlayback: true,
             channelCount: 1,            // mono — reduces processing
             sampleRate: 16000,          // voice-optimised sample rate
           }
@@ -2943,65 +2918,43 @@
         const source = this._audioCtx.createMediaStreamSource(this._micStream);
 
         // ── Noise cancellation chain ──
-        // Hindi-specific tuning targets Indian acoustic environments:
-        //   • 50 Hz power-line hum (Indian mains frequency)
-        //   • Higher-frequency cut-in for the high-pass (traffic, fan rumble peaks ~100 Hz)
-        //   • Voice presence boost at 1500 Hz (strong Hindi vowel formants F1/F2 zone)
-        //   • More aggressive compressor to handle wide volume variance in Hindi speech
-
         // 1. High-pass filter — removes low-frequency rumble (AC, traffic, fan hum)
         const highPass = this._audioCtx.createBiquadFilter();
         highPass.type = 'highpass';
-        highPass.frequency.value = isHindi ? 100 : 85;  // Hindi: cut below 100 Hz (Indian env noise)
+        highPass.frequency.value = 85;   // cut below 85 Hz
         highPass.Q.value = 0.7;
 
-        // 2. Notch filter — removes 50 Hz Indian power-line hum (only applied for Hindi)
-        const notch50 = this._audioCtx.createBiquadFilter();
-        notch50.type = 'notch';
-        notch50.frequency.value = 50;
-        notch50.Q.value = 10;   // narrow notch — surgical cut at exactly 50 Hz
-
-        // 3. Low-pass filter — removes high-frequency hiss / electronic noise
+        // 2. Low-pass filter — removes high-frequency hiss / electronic noise
         const lowPass = this._audioCtx.createBiquadFilter();
         lowPass.type = 'lowpass';
         lowPass.frequency.value = 8000;  // cut above 8 kHz (voice is 100–4000 Hz)
         lowPass.Q.value = 0.7;
 
-        // 4. Peaking filter — boost the voice presence band
-        //    Hindi: 1500 Hz targets the strong F1/F2 vowel formant region of Hindi speech
-        //    English: 2500 Hz targets consonant clarity / presence region
+        // 3. Peaking filter — boost the voice presence band (1–4 kHz)
         const voiceBoost = this._audioCtx.createBiquadFilter();
         voiceBoost.type = 'peaking';
-        voiceBoost.frequency.value = isHindi ? 1500 : 2500;
-        voiceBoost.Q.value = isHindi ? 1.2 : 1.0;
-        voiceBoost.gain.value = isHindi ? 4 : 3;  // +4 dB for Hindi, +3 dB for others
+        voiceBoost.frequency.value = 2500;
+        voiceBoost.Q.value = 1.0;
+        voiceBoost.gain.value = 3;       // +3 dB boost to speech clarity
 
-        // 5. Compressor — normalises loud/quiet speech, squashes noise floor
-        //    Hindi: lower threshold + higher ratio to handle wide volume variation
+        // 4. Compressor — normalises loud/quiet speech, squashes noise floor
         const compressor = this._audioCtx.createDynamicsCompressor();
-        compressor.threshold.value = isHindi ? -40 : -35;
+        compressor.threshold.value = -35;  // start compressing at -35 dB
         compressor.knee.value = 10;
-        compressor.ratio.value = isHindi ? 8 : 6;
+        compressor.ratio.value = 6;        // 6:1 ratio
         compressor.attack.value = 0.005;   // 5 ms — fast attack for speech
         compressor.release.value = 0.15;   // 150 ms — smooth release
 
-        // 6. Noise gate via gain node — suppress signals below threshold
+        // 5. Noise gate via gain node — suppress signals below threshold
         this._noiseGate = this._audioCtx.createGain();
         this._noiseGate.gain.value = 1;
         this._noiseFloor = 0;              // calibrated in first ~500 ms
         this._noiseCalibFrames = 0;
         this._noiseCalibSum = 0;
-        // Hindi: wider noise floor margin — Indian environments are noisier
-        this._noiseFloorMargin = isHindi ? 1.6 : 1.4;
 
-        // Connect chain: mic → highPass → notch50 (Hindi) → lowPass → voiceBoost → compressor → noiseGate → analyser
+        // Connect chain: mic → highPass → lowPass → voiceBoost → compressor → noiseGate → analyser
         source.connect(highPass);
-        if (isHindi) {
-          highPass.connect(notch50);
-          notch50.connect(lowPass);
-        } else {
-          highPass.connect(lowPass);
-        }
+        highPass.connect(lowPass);
         lowPass.connect(voiceBoost);
         voiceBoost.connect(compressor);
         compressor.connect(this._noiseGate);
@@ -3012,9 +2965,7 @@
         this._noiseGate.connect(this._analyser);
 
         // Store filter refs for cleanup
-        this._audioNodes = isHindi
-          ? [highPass, notch50, lowPass, voiceBoost, compressor, this._noiseGate]
-          : [highPass, lowPass, voiceBoost, compressor, this._noiseGate];
+        this._audioNodes = [highPass, lowPass, voiceBoost, compressor, this._noiseGate];
 
         this._analysisLoop();
       } catch (_) {
@@ -3050,9 +3001,8 @@
         this._noiseCalibSum += avg;
         this._noiseCalibFrames++;
         if (this._noiseCalibFrames === 30) {
-          const margin = this._noiseFloorMargin || 1.4;
-          this._noiseFloor = (this._noiseCalibSum / 30) * margin;
-          console.log(`[Audio] Noise floor calibrated: ${this._noiseFloor.toFixed(1)} (margin ×${margin})`);
+          this._noiseFloor = (this._noiseCalibSum / 30) * 1.4; // 40% above avg ambient
+          console.log(`[Audio] Noise floor calibrated: ${this._noiseFloor.toFixed(1)}`);
         }
       }
 
@@ -3081,6 +3031,279 @@
           Math.sin(t * 8.3) * 0.1 +
           Math.sin(t * 13.1) * 0.08 +
           Math.random() * 0.12;
+        this.onAudioLevel(Math.max(0, Math.min(1, level)));
+        requestAnimationFrame(tick);
+      };
+      tick();
+    }
+  }
+
+  /* ════════════════════════════════════════════════════
+     §5b  WHISPER SPEECH ENGINE
+     ════════════════════════════════════════════════════
+     Uses OpenAI Whisper for STT and OpenAI TTS for speech.
+     Audio is recorded via MediaRecorder, sent to the server's
+     /api/whisper/stt endpoint, and TTS audio is fetched from
+     /api/whisper/tts and played via HTMLAudioElement.
+     Exposes the same callback interface as SpeechEngine.
+     ════════════════════════════════════════════════════ */
+
+  class WhisperSpeechEngine {
+    /**
+     * @param {object} opts
+     * @param {string} opts.serverUrl   — App server base URL
+     * @param {string} opts.apiKey      — Tenant API key (x-api-key header)
+     * @param {string} [opts.lang]      — BCP-47 language tag (e.g. 'en-IN')
+     * @param {string} [opts.ttsVoice]  — OpenAI TTS voice (alloy|echo|fable|onyx|nova|shimmer)
+     * @param {number} [opts.silenceMs] — ms of silence before auto-submitting (default 1500)
+     */
+    constructor(opts = {}) {
+      this._serverUrl  = (opts.serverUrl || '').replace(/\/$/, '');
+      this._apiKey     = opts.apiKey || '';
+      this.lang        = opts.lang || 'en-IN';
+      this._ttsVoice   = opts.ttsVoice || 'nova';
+      this._silenceMs  = opts.silenceMs || 1500;
+
+      // State
+      this.isListening = false;
+      this.isSpeaking  = false;
+      this._recorder   = null;
+      this._chunks     = [];
+      this._silenceTimer = null;
+      this._audioEl    = null;
+      this._micStream  = null;
+      this._audioCtx   = null;
+      this._analyser   = null;
+      this._levelRAF   = null;
+      this._bargeInActive = false;
+
+      // Callbacks — same interface as SpeechEngine
+      this.onResult         = () => {};
+      this.onInterim        = () => {};
+      this.onListeningStart = () => {};
+      this.onListeningEnd   = () => {};
+      this.onSpeakStart     = () => {};
+      this.onSpeakEnd       = () => {};
+      this.onError          = () => {};
+      this.onAudioLevel     = () => {};
+      this.onBargeIn        = () => {};
+    }
+
+    get supported() { return !!(navigator.mediaDevices && window.MediaRecorder); }
+
+    /* ─── STT ─── */
+
+    async startListening() {
+      if (this.isListening) return;
+      if (this.isSpeaking) this.stopSpeaking();
+
+      try {
+        this._micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { noiseSuppression: true, echoCancellation: true, autoGainControl: true, channelCount: 1, sampleRate: 16000 },
+        });
+      } catch (e) {
+        this.onError('Microphone access denied. Please allow mic permission and try again.');
+        return;
+      }
+
+      this._chunks = [];
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg';
+
+      this._recorder = new MediaRecorder(this._micStream, { mimeType });
+      this._recorder.ondataavailable = (e) => { if (e.data.size > 0) this._chunks.push(e.data); };
+      this._recorder.onstop = () => this._submitAudio();
+      this._recorder.start(200); // collect in 200ms chunks
+
+      this.isListening = true;
+      this.onListeningStart();
+      this._startAudioAnalysis();
+      this._startSilenceDetection();
+    }
+
+    stopListening() {
+      if (!this.isListening) return;
+      this.isListening = false;
+      this._clearSilenceTimer();
+      this._stopAudioAnalysis();
+      if (this._recorder && this._recorder.state !== 'inactive') {
+        this._recorder.stop();
+      }
+      // _recorder.onstop will call _submitAudio; onListeningEnd fires there
+    }
+
+    async _submitAudio() {
+      this._stopMicStream();
+      this.onListeningEnd();
+
+      if (this._chunks.length === 0) return;
+
+      const blob = new Blob(this._chunks, { type: this._recorder?.mimeType || 'audio/webm' });
+      this._chunks = [];
+
+      // Don't bother sending very short clips (noise / accidental)
+      if (blob.size < 2000) return;
+
+      try {
+        const form = new FormData();
+        form.append('audio', blob, 'audio.webm');
+        form.append('lang', this.lang);
+
+        const headers = {};
+        if (this._apiKey) headers['x-api-key'] = this._apiKey;
+
+        const res = await fetch(`${this._serverUrl}/api/whisper/stt`, { method: 'POST', headers, body: form });
+        if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || res.statusText); }
+        const { transcript } = await res.json();
+        if (transcript && transcript.trim()) this.onResult(transcript.trim());
+      } catch (e) {
+        console.error('[Whisper STT]', e.message);
+        this.onError('Whisper STT failed: ' + e.message);
+      }
+    }
+
+    /* ─── TTS ─── */
+
+    speak(text) {
+      return new Promise((resolve) => {
+        if (!text) { resolve(); return; }
+
+        const headers = { 'Content-Type': 'application/json' };
+        if (this._apiKey) headers['x-api-key'] = this._apiKey;
+
+        fetch(`${this._serverUrl}/api/whisper/tts`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ text, voice: this._ttsVoice }),
+        })
+          .then((res) => {
+            if (!res.ok) throw new Error(res.statusText);
+            return res.blob();
+          })
+          .then((blob) => {
+            const url = URL.createObjectURL(blob);
+            this._audioEl = new Audio(url);
+            this._audioEl.playbackRate = 1.0;
+
+            this._audioEl.onplay  = () => { this.isSpeaking = true; this.onSpeakStart(); this._simulateSpeechAudio(text); };
+            this._audioEl.onended = () => {
+              this.isSpeaking = false;
+              URL.revokeObjectURL(url);
+              if (!this._bargeInActive) this.onSpeakEnd();
+              this._bargeInActive = false;
+              resolve();
+            };
+            this._audioEl.onerror = () => {
+              this.isSpeaking = false;
+              URL.revokeObjectURL(url);
+              this.onSpeakEnd();
+              resolve();
+            };
+
+            this._audioEl.play().catch((e) => {
+              console.warn('[Whisper TTS] play() blocked:', e.message);
+              this.onSpeakEnd();
+              resolve();
+            });
+          })
+          .catch((e) => {
+            console.error('[Whisper TTS]', e.message);
+            this.onError('Whisper TTS failed: ' + e.message);
+            this.onSpeakEnd();
+            resolve();
+          });
+      });
+    }
+
+    stopSpeaking() {
+      if (this._audioEl) {
+        this._audioEl.pause();
+        this._audioEl = null;
+      }
+      this.isSpeaking = false;
+      this.onSpeakEnd();
+    }
+
+    interrupt() {
+      this._bargeInActive = true;
+      if (this._audioEl) { this._audioEl.pause(); this._audioEl = null; }
+      this.isSpeaking = false;
+      this.onSpeakEnd();
+    }
+
+    setLang(newLang) { this.lang = newLang; }
+
+    /* ─── Silence detection (auto-submit after pause) ─── */
+
+    _startSilenceDetection() {
+      this._clearSilenceTimer();
+      // Poll audio level; reset timer whenever voice is detected
+      let lastVoiceTime = Date.now();
+      const check = () => {
+        if (!this.isListening) return;
+        const now = Date.now();
+        const level = this._lastLevel || 0;
+        if (level > 0.04) lastVoiceTime = now;
+        if (now - lastVoiceTime > this._silenceMs) {
+          console.log('[Whisper STT] Silence detected — submitting');
+          this.stopListening();
+          return;
+        }
+        this._silenceTimer = setTimeout(check, 100);
+      };
+      this._silenceTimer = setTimeout(check, 300);
+    }
+
+    _clearSilenceTimer() {
+      if (this._silenceTimer) { clearTimeout(this._silenceTimer); this._silenceTimer = null; }
+    }
+
+    /* ─── Audio level analysis (for orb animation) ─── */
+
+    async _startAudioAnalysis() {
+      try {
+        if (!this._micStream) return;
+        this._audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const source = this._audioCtx.createMediaStreamSource(this._micStream);
+        this._analyser = this._audioCtx.createAnalyser();
+        this._analyser.fftSize = 256;
+        this._analyser.smoothingTimeConstant = 0.7;
+        source.connect(this._analyser);
+        this._analysisLoop();
+      } catch (_) { /* non-critical */ }
+    }
+
+    _analysisLoop() {
+      if (!this.isListening || !this._analyser) return;
+      const data = new Uint8Array(this._analyser.frequencyBinCount);
+      this._analyser.getByteFrequencyData(data);
+      const avg = data.reduce((a, b) => a + b, 0) / data.length;
+      this._lastLevel = Math.min(1, avg / 128);
+      this.onAudioLevel(this._lastLevel);
+      this._levelRAF = requestAnimationFrame(() => this._analysisLoop());
+    }
+
+    _stopAudioAnalysis() {
+      if (this._levelRAF) { cancelAnimationFrame(this._levelRAF); this._levelRAF = null; }
+      this._analyser = null;
+      this._lastLevel = 0;
+    }
+
+    _stopMicStream() {
+      if (this._micStream) { this._micStream.getTracks().forEach(t => t.stop()); this._micStream = null; }
+    }
+
+    _simulateSpeechAudio(text) {
+      const words = text.split(/\s+/).length;
+      const durationMs = words * 300;
+      const start = Date.now();
+      const tick = () => {
+        if (!this.isSpeaking) return;
+        const elapsed = Date.now() - start;
+        if (elapsed > durationMs) { this.onAudioLevel(0); return; }
+        const t = elapsed / 1000;
+        const level = 0.3 + Math.sin(t * 5.5) * 0.15 + Math.sin(t * 8.3) * 0.1 + Math.random() * 0.12;
         this.onAudioLevel(Math.max(0, Math.min(1, level)));
         requestAnimationFrame(tick);
       };
@@ -4990,6 +5213,7 @@
       this.orb = new OrbRenderer(this.canvas);
       this.miniOrbRenderer = new OrbRenderer(this.miniCanvas);
       this._deepgramMode = !!this.config.deepgramEnabled;
+      this._whisperMode  = !this._deepgramMode && !!this.config.whisperEnabled;
 
       if (this._deepgramMode) {
         this.speech = new DeepgramVoiceAgent({
@@ -4998,6 +5222,14 @@
           appApiKey: this.config.apiKey,
           settings: this.config.deepgramSettings,
           greeting: this.config.greeting,
+        });
+      } else if (this._whisperMode) {
+        this.speech = new WhisperSpeechEngine({
+          serverUrl: this.config.serverUrl,
+          apiKey: this.config.apiKey,
+          lang: this.config.lang,
+          ttsVoice: this.config.whisperTtsVoice,
+          silenceMs: this.config.whisperSilenceMs,
         });
       } else {
         this.speech = new SpeechEngine(this.config.lang, this.config.voiceGender);
@@ -5108,33 +5340,10 @@
         }
       };
 
-      // Browsers often reject SpeechRecognition started on page load because
-      // there has been no user gesture yet. Defer wake-word startup until the
-      // first interaction so manual listening is not poisoned by an early deny.
-      this._armWakeWordStart();
-    }
-
-    _armWakeWordStart() {
-      if (!this.wakeWordDetector || this._wakeWordStartArmed) return;
-
-      this._wakeWordStartArmed = true;
-
-      const startWakeWord = () => {
-        window.removeEventListener('pointerdown', startWakeWord, true);
-        window.removeEventListener('keydown', startWakeWord, true);
-        this._wakeWordStartArmed = false;
-
-        if (this.isOpen || this.miniOrbActive || !this.wakeWordDetector) return;
-
-        setTimeout(() => {
-          if (!this.isOpen && !this.miniOrbActive && this.wakeWordDetector && !this.wakeWordDetector.isRunning) {
-            this.wakeWordDetector.start();
-          }
-        }, 150);
-      };
-
-      window.addEventListener('pointerdown', startWakeWord, true);
-      window.addEventListener('keydown', startWakeWord, true);
+      // Start listening for wake word after a short delay (let page load)
+      setTimeout(() => {
+        this.wakeWordDetector.start();
+      }, 1500);
     }
 
     /* ── Chart.js CDN Loader ── */
@@ -6625,7 +6834,7 @@
      * @param {string} config.serverUrl - Backend URL (required)
      * @param {string} [config.position='bottom-right']
      * @param {string} [config.greeting]
-     * @param {string} [config.lang='en-US']
+     * @param {string} [config.lang='en-IN']
      * @param {number} [config.size=64]
      * @param {string} [config.wakeWord='hey vedaa'] - Wake word phrase
      * @param {boolean} [config.wakeWordEnabled=true] - Enable wake word
@@ -6633,6 +6842,9 @@
      * @param {boolean} [config.deepgramEnabled=false] - Use Deepgram Voice Agent (WS) instead of browser speech
      * @param {string} [config.deepgramApiKey] - Deepgram API key (or use server proxy)
      * @param {object} [config.deepgramSettings] - Full Deepgram Settings JSON override
+     * @param {boolean} [config.whisperEnabled=false] - Use OpenAI Whisper STT + TTS (requires OPENAI_API_KEY on server)
+     * @param {string} [config.whisperTtsVoice='nova'] - OpenAI TTS voice: alloy|echo|fable|onyx|nova|shimmer
+     * @param {number} [config.whisperSilenceMs=1500] - ms of silence before speech is auto-submitted
      */
     init(config = {}) {
       if (this._instance) {

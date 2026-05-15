@@ -1,0 +1,45 @@
+{
+  "id": "wf_1778850529550",
+  "name": "Fetch Top 5 Batches with Highest Defects",
+  "description": "Query to get top 5 batches with highest defects found in production data",
+  "steps": [
+    {
+      "stepNumber": 1,
+      "timestamp": "2026-05-15T13:08:51.187Z",
+      "type": "click",
+      "description": "Execute SQL query to get top 5 batches with highest defects",
+      "selector": "#execute-query-button",
+      "elementText": "Execute",
+      "elementType": null,
+      "url": null,
+      "urlPattern": null,
+      "fieldName": null,
+      "fieldValue": null,
+      "validation": null,
+      "errorSelector": null,
+      "domSnapshot": null,
+      "screenshot": null
+    },
+    {
+      "stepNumber": 2,
+      "timestamp": "2026-05-15T13:08:52.918Z",
+      "type": "verify",
+      "description": "Verify the query result shows top 5 batches with highest defects",
+      "selector": null,
+      "elementText": null,
+      "elementType": null,
+      "url": null,
+      "urlPattern": null,
+      "fieldName": null,
+      "fieldValue": null,
+      "validation": null,
+      "errorSelector": null,
+      "domSnapshot": null,
+      "screenshot": null
+    }
+  ],
+  "createdAt": "2026-05-15T13:08:49.550Z",
+  "status": "completed",
+  "completedAt": "2026-05-15T13:08:54.255Z",
+  "totalSteps": 2
+}
