@@ -5321,12 +5321,9 @@
             if (this.wakeLabel) this.wakeLabel.textContent = 'Say "Hey Vedaa"';
           }, 1200);
         }
-        // Close mini orb if active, open full orb mode
-        if (this.miniOrbActive) {
-          this.closeMiniOrb();
-        }
-        if (!this.isOpen) {
-          this.open();
+        // Open mini orb on wake word (full overlay only opens on click)
+        if (!this.miniOrbActive && !this.isOpen) {
+          this.openMiniOrb();
         }
       };
 
@@ -5369,11 +5366,11 @@
         setTimeout(() => this._toggleChat(true), 400);
       });
 
-      // Click mini orb to close or expand to full mode
+      // Click mini orb → expand to full overlay
       this.miniCanvas.addEventListener('click', () => {
         if (this.miniOrbActive) {
-          // Close mini orb
           this.closeMiniOrb();
+          setTimeout(() => this.open(), 100);
         }
       });
 
@@ -5832,6 +5829,9 @@
       this.speech.stopListening();
       this.speech.stopSpeaking();
 
+      // Restore main speech handlers (mini orb overwrites them; must reset before full overlay can work)
+      this._bindSpeech();
+
       // Resume wake word
       if (this.wakeWordDetector) {
         setTimeout(() => {
@@ -5844,28 +5844,41 @@
 
     _startMiniOrbListening() {
       const s = this.speech;
+      let gotResult = false;
 
       s.onInterim = (text) => {
-        // Just animate orb, no text display
-        this.miniOrbRenderer.setAudioLevel(0.5); // Pulse while speaking
+        this.miniOrbRenderer.setAudioLevel(0.5);
       };
 
-      s.onFinal = (text) => {
+      s.onResult = (text) => {
+        gotResult = true;
+        s.stopListening();
         // Set to processing state
         this.miniOrbRenderer.setState(STATES.PROCESSING);
         this._handleMiniOrbMessage(text);
       };
 
-      s.onEnd = () => {
-        // Auto-close after response is spoken
-        setTimeout(() => {
-          if (this.miniOrbActive) {
-            this.closeMiniOrb();
-          }
-        }, 1000);
+      s.onListeningEnd = () => {
+        // If no speech was heard, close the orb
+        if (!gotResult && this.miniOrbActive) {
+          setTimeout(() => {
+            if (this.miniOrbActive && !gotResult) {
+              this.closeMiniOrb();
+            }
+          }, 800);
+        }
       };
 
-      s.startListening();
+      s.onAudioLevel = (level) => {
+        this.miniOrbRenderer.setAudioLevel(level);
+      };
+
+      // Delay start to let wake word detector fully release the mic
+      setTimeout(() => {
+        if (this.miniOrbActive) {
+          s.startListening();
+        }
+      }, 800);
     }
 
     async _handleMiniOrbMessage(text) {
