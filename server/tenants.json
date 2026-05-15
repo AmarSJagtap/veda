@@ -92,7 +92,7 @@
     "broker-buddy": {
       "name": "Broker Buddy – Voice Trading Assistant",
       "apiKey": "vb_bb_8f3a2d7e1c9b4056",
-      "enabled": true,
+      "enabled": false,
       "kbFolders": ["default"],
       "databases": ["appdb"],
       "allowedTables": [],

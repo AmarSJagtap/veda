@@ -2347,6 +2347,7 @@
       this._bargeInRecognition = null; // Separate recognition for barge-in
       this._bargeInActive = false;   // True during barge-in to suppress onSpeakEnd
       this._currentTTSText = '';     // Track what TTS is currently saying (for echo filtering)
+      this._ttsBoundaryIndex = 0;    // Current word char-offset in TTS text (from onboundary)
       this._bargeInReady = false;    // Delay barge-in to avoid TTS echo at start
       this._initRecognition();
       this._pickVoice();             // Pre-select best voice
@@ -2607,20 +2608,34 @@
           }
         }, 3000);
 
+        // Track which word the TTS is currently speaking so the echo filter
+        // uses a sliding window instead of the full response text.
+        this._ttsBoundaryIndex = 0;
+        utterance.onboundary = (e) => {
+          if (e.name === 'word') this._ttsBoundaryIndex = e.charIndex;
+        };
+
         utterance.onstart = () => {
           started = true;
           clearTimeout(safetyTimer);
           this.isSpeaking = true;
           this._currentTTSText = text.toLowerCase();
+          this._ttsBoundaryIndex = 0;
           this.onSpeakStart();
           this._simulateSpeechAudio(text);
-          // Delay barge-in activation to let TTS audio settle and avoid echo false-triggers
+
+          // ── Barge-in during TTS ──
+          // For Hindi: barge-in is completely disabled while the bot is speaking.
+          // The browser's SpeechRecognition receives a raw mic stream that bypasses
+          // all WebAudio processing, so acoustic echo (speaker → mic) cannot be
+          // filtered reliably in software. Any attempt to run recognition concurrently
+          // with Hindi TTS causes the bot to interrupt itself.
+          // The user can still speak immediately after TTS ends via onSpeakEnd → startListening.
           this._bargeInReady = false;
-          setTimeout(() => {
-            this._bargeInReady = true;
-          }, 800);
-          // Start barge-in listener so user can interrupt by voice
-          this._startBargeInListener();
+          if (!this.lang.startsWith('hi')) {
+            this._startBargeInListener();
+            setTimeout(() => { this._bargeInReady = true; }, 800);
+          }
 
           // ── Chrome keep-alive: prevent Chrome from pausing mid-utterance ──
           // Chrome will pause TTS after ~15 s of continuous speech. Periodically
@@ -2637,6 +2652,7 @@
           clearInterval(this._ttsKeepAlive);
           this.isSpeaking = false;
           this._currentTTSText = '';
+          this._ttsBoundaryIndex = 0;
           this._bargeInReady = false;
           this._stopBargeInListener();
           // Don't fire onSpeakEnd if barge-in already handled the transition
@@ -2656,6 +2672,7 @@
           clearInterval(this._ttsKeepAlive);
           this.isSpeaking = false;
           this._currentTTSText = '';
+          this._ttsBoundaryIndex = 0;
           this._bargeInReady = false;
           this._stopBargeInListener();
           if (this._bargeInActive) {
@@ -2724,22 +2741,49 @@
           // Ignore empty / very short fragments
           if (transcript.length < 2) continue;
 
-          // ── TTS Echo Filter — lightweight ──
-          const heard = transcript.toLowerCase().replace(/[.,!?;:'"।॥]/g, '');
-          const tts = this._currentTTSText.replace(/[.,!?;:'"।॥]/g, '');
+          // ── TTS Echo Filter (sliding window) ──
+          // Compare against a window around the current speaking position rather than
+          // the full TTS text. This avoids:
+          //   • False positives: user saying a word that appears elsewhere in the response
+          //   • False negatives: echo from early TTS no longer in the window
+          const heard = transcript.toLowerCase().replace(/[.,!?;:'"।॥]/g, '').trim();
 
-          // Only reject if the heard text is a direct substring of TTS
-          // (exact echo). Don't do phrase matching — too many false negatives.
-          if (tts && tts.includes(heard)) {
-            console.log(`[BargeIn] Echo (substring): "${transcript}"`);
-            continue;
+          if (this._currentTTSText && heard.length > 0) {
+            const fullTTS = this._currentTTSText;
+            const pos = this._ttsBoundaryIndex || 0;
+            // Window: 150 chars before current word (recently spoken) + 40 chars ahead
+            const winStart = Math.max(0, pos - 150);
+            const winEnd   = Math.min(fullTTS.length, pos + 40);
+            const window   = fullTTS.slice(winStart, winEnd)
+                               .replace(/[.,!?;:'"।॥]/g, '').trim();
+
+            // Substring check against window
+            if (window.includes(heard)) {
+              console.log(`[BargeIn] Echo (window-substring pos=${pos}): "${transcript}"`);
+              continue;
+            }
+
+            // Word-overlap check against window — catches Hindi echoes where recognition
+            // produces slightly different conjuncts/characters than the original TTS text.
+            const heardWords  = heard.split(/\s+/).filter(w => w.length > 1);
+            const windowWords = new Set(window.split(/\s+/));
+            if (heardWords.length > 0) {
+              const overlapCount = heardWords.filter(w => windowWords.has(w)).length;
+              const overlapRatio = overlapCount / heardWords.length;
+              if (overlapRatio >= 0.55) {
+                console.log(`[BargeIn] Echo (word-overlap ${(overlapRatio * 100).toFixed(0)}% pos=${pos}): "${transcript}"`);
+                continue;
+              }
+            }
           }
 
           // ── Interim path — trigger on sustained non-echo speech ──
           if (!isFinal) {
             this._bargeInInterimCount++;
-            // Instantly interrupt on the very first non-echo interim for a human-like, snappy reaction time
-            if (this._bargeInInterimCount >= 1) {
+            // For Hindi, require more interim hits before triggering barge-in to reduce
+            // false positives caused by low recognition accuracy and echo pickup.
+            const interimThreshold = this.lang.startsWith('hi') ? 2 : 1;
+            if (this._bargeInInterimCount >= interimThreshold) {
               console.log(`[BargeIn] Interim interrupt (${this._bargeInInterimCount} hits): "${transcript}"`);
               this._executeBargeIn(transcript);
               return;
@@ -2876,11 +2920,16 @@
         if (!this._audioCtx) {
           this._audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         }
+
+        const isHindi = this.lang.startsWith('hi');
+
         this._micStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             noiseSuppression: true,
             echoCancellation: true,
             autoGainControl: true,
+            // suppressLocalAudioPlayback reduces TTS echo leaking back into the mic
+            suppressLocalAudioPlayback: true,
             channelCount: 1,            // mono — reduces processing
             sampleRate: 16000,          // voice-optimised sample rate
           }
@@ -2888,43 +2937,65 @@
         const source = this._audioCtx.createMediaStreamSource(this._micStream);
 
         // ── Noise cancellation chain ──
+        // Hindi-specific tuning targets Indian acoustic environments:
+        //   • 50 Hz power-line hum (Indian mains frequency)
+        //   • Higher-frequency cut-in for the high-pass (traffic, fan rumble peaks ~100 Hz)
+        //   • Voice presence boost at 1500 Hz (strong Hindi vowel formants F1/F2 zone)
+        //   • More aggressive compressor to handle wide volume variance in Hindi speech
+
         // 1. High-pass filter — removes low-frequency rumble (AC, traffic, fan hum)
         const highPass = this._audioCtx.createBiquadFilter();
         highPass.type = 'highpass';
-        highPass.frequency.value = 85;   // cut below 85 Hz
+        highPass.frequency.value = isHindi ? 100 : 85;  // Hindi: cut below 100 Hz (Indian env noise)
         highPass.Q.value = 0.7;
 
-        // 2. Low-pass filter — removes high-frequency hiss / electronic noise
+        // 2. Notch filter — removes 50 Hz Indian power-line hum (only applied for Hindi)
+        const notch50 = this._audioCtx.createBiquadFilter();
+        notch50.type = 'notch';
+        notch50.frequency.value = 50;
+        notch50.Q.value = 10;   // narrow notch — surgical cut at exactly 50 Hz
+
+        // 3. Low-pass filter — removes high-frequency hiss / electronic noise
         const lowPass = this._audioCtx.createBiquadFilter();
         lowPass.type = 'lowpass';
         lowPass.frequency.value = 8000;  // cut above 8 kHz (voice is 100–4000 Hz)
         lowPass.Q.value = 0.7;
 
-        // 3. Peaking filter — boost the voice presence band (1–4 kHz)
+        // 4. Peaking filter — boost the voice presence band
+        //    Hindi: 1500 Hz targets the strong F1/F2 vowel formant region of Hindi speech
+        //    English: 2500 Hz targets consonant clarity / presence region
         const voiceBoost = this._audioCtx.createBiquadFilter();
         voiceBoost.type = 'peaking';
-        voiceBoost.frequency.value = 2500;
-        voiceBoost.Q.value = 1.0;
-        voiceBoost.gain.value = 3;       // +3 dB boost to speech clarity
+        voiceBoost.frequency.value = isHindi ? 1500 : 2500;
+        voiceBoost.Q.value = isHindi ? 1.2 : 1.0;
+        voiceBoost.gain.value = isHindi ? 4 : 3;  // +4 dB for Hindi, +3 dB for others
 
-        // 4. Compressor — normalises loud/quiet speech, squashes noise floor
+        // 5. Compressor — normalises loud/quiet speech, squashes noise floor
+        //    Hindi: lower threshold + higher ratio to handle wide volume variation
         const compressor = this._audioCtx.createDynamicsCompressor();
-        compressor.threshold.value = -35;  // start compressing at -35 dB
+        compressor.threshold.value = isHindi ? -40 : -35;
         compressor.knee.value = 10;
-        compressor.ratio.value = 6;        // 6:1 ratio
+        compressor.ratio.value = isHindi ? 8 : 6;
         compressor.attack.value = 0.005;   // 5 ms — fast attack for speech
         compressor.release.value = 0.15;   // 150 ms — smooth release
 
-        // 5. Noise gate via gain node — suppress signals below threshold
+        // 6. Noise gate via gain node — suppress signals below threshold
         this._noiseGate = this._audioCtx.createGain();
         this._noiseGate.gain.value = 1;
         this._noiseFloor = 0;              // calibrated in first ~500 ms
         this._noiseCalibFrames = 0;
         this._noiseCalibSum = 0;
+        // Hindi: wider noise floor margin — Indian environments are noisier
+        this._noiseFloorMargin = isHindi ? 1.6 : 1.4;
 
-        // Connect chain: mic → highPass → lowPass → voiceBoost → compressor → noiseGate → analyser
+        // Connect chain: mic → highPass → notch50 (Hindi) → lowPass → voiceBoost → compressor → noiseGate → analyser
         source.connect(highPass);
-        highPass.connect(lowPass);
+        if (isHindi) {
+          highPass.connect(notch50);
+          notch50.connect(lowPass);
+        } else {
+          highPass.connect(lowPass);
+        }
         lowPass.connect(voiceBoost);
         voiceBoost.connect(compressor);
         compressor.connect(this._noiseGate);
@@ -2935,7 +3006,9 @@
         this._noiseGate.connect(this._analyser);
 
         // Store filter refs for cleanup
-        this._audioNodes = [highPass, lowPass, voiceBoost, compressor, this._noiseGate];
+        this._audioNodes = isHindi
+          ? [highPass, notch50, lowPass, voiceBoost, compressor, this._noiseGate]
+          : [highPass, lowPass, voiceBoost, compressor, this._noiseGate];
 
         this._analysisLoop();
       } catch (_) {
@@ -2971,8 +3044,9 @@
         this._noiseCalibSum += avg;
         this._noiseCalibFrames++;
         if (this._noiseCalibFrames === 30) {
-          this._noiseFloor = (this._noiseCalibSum / 30) * 1.4; // 40% above avg ambient
-          console.log(`[Audio] Noise floor calibrated: ${this._noiseFloor.toFixed(1)}`);
+          const margin = this._noiseFloorMargin || 1.4;
+          this._noiseFloor = (this._noiseCalibSum / 30) * margin;
+          console.log(`[Audio] Noise floor calibrated: ${this._noiseFloor.toFixed(1)} (margin ×${margin})`);
         }
       }
 

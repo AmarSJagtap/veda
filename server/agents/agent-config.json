@@ -1,4 +1,8 @@
 {
+  "groups": {
+    "groww": { "enabled": false },
+    "bajaj": { "enabled": false }
+  },
   "apis": [
     {
       "name": "get_random_joke",
@@ -10,13 +14,13 @@
     {
       "name": "get_weather",
       "description": "Get current weather for a city. Use when the user asks about the weather.",
-      "endpoint": "https://wttr.in",
+      "endpoint": "https://wttr.in/{q}",
       "method": "GET",
       "params": {
-        "q": { "type": "string", "description": "City name (e.g. Mumbai, Delhi, London)", "required": true },
+        "q": { "type": "string", "description": "City name (e.g. Mumbai, Delhi, London)", "required": true, "_pathParam": true },
         "format": { "type": "string", "description": "Response format — use 'j1' for JSON", "required": false }
       },
-      "_note": "Free weather API — no key needed. Append /{city}?format=j1 for JSON."
+      "_note": "Free weather API — no key needed. City is path param, format=j1 for JSON."
     },
 
     {

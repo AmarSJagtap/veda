@@ -187,6 +187,109 @@ class AIService {
     return prompt;
   }
 
+  /** @private */
+  _buildKbQueries(userMessage, lang = 'en-IN') {
+    const queries = [userMessage];
+    const lower = (userMessage || '').toLowerCase();
+    const isHindi = lang.startsWith('hi');
+
+    const wantsFundHoldings =
+      /(fund|stocks?|holding|holdings|portfolio|constituents?|nav)/i.test(userMessage) ||
+      /(फंड|स्टॉक|स्टॉक्स|होल्डिंग|पोर्टफोलियो|नाव)/.test(userMessage);
+    const wantsTopList =
+      /(top|highest|largest|five|5|leading)/i.test(userMessage) ||
+      /(टॉप|शीर्ष|सबसे|पाँच|5)/.test(userMessage);
+
+    if (wantsFundHoldings && wantsTopList) {
+      queries.push(`${userMessage} holdings portfolio company name % to nav`);
+      queries.push(`${userMessage} top holdings portfolio constituents`);
+      queries.push(`${userMessage} active share company name % to nav holdings`);
+    }
+
+    if (/(large\s*cap|largecap|लार्ज\s*कैप)/i.test(userMessage)) {
+      queries.push(`${userMessage} large cap fund holdings company name % to nav`);
+      queries.push(`${userMessage} bajaj finserv large cap fund holdings`);
+      queries.push(`${userMessage} large cap fund active share company name % to nav`);
+    }
+
+    if (/(active\s*share|portfolio\s*overlap)/i.test(lower)) {
+      queries.push(`${userMessage} active share company name % to nav holdings`);
+    }
+
+    // Hindi voice queries often ask for English fund data. Add an English finance
+    // suffix so TF-IDF retrieval can still hit PDF headings/tables written in English.
+    if (isHindi && wantsFundHoldings) {
+      queries.push(`${userMessage} mutual fund holdings top stocks company name portfolio`);
+    }
+
+    return [...new Set(queries.map(q => q.trim()).filter(Boolean))];
+  }
+
+  /** @private */
+  _searchKnowledgeBase(vectorStore, userMessage, lang = 'en-IN') {
+    if (!vectorStore) return [];
+
+    const queries = this._buildKbQueries(userMessage, lang);
+    const merged = new Map();
+
+    for (const query of queries) {
+      const results = vectorStore.search(query, 8);
+      for (const result of results) {
+        const key = `${result.source}::${result.text}`;
+        const existing = merged.get(key);
+        if (!existing || result.score > existing.score) {
+          merged.set(key, result);
+        }
+      }
+    }
+
+    return [...merged.values()]
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 6);
+  }
+
+  /** @private */
+  _expandKbNeighborhood(vectorStore, kbResults) {
+    if (!vectorStore?.documents?.length || kbResults.length === 0) return kbResults;
+
+    const ordered = [];
+    const seen = new Set();
+    const docs = vectorStore.documents;
+
+    const pushResult = (result) => {
+      const key = `${result.source}::${result.text}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      ordered.push(result);
+    };
+
+    for (const result of kbResults.slice(0, 3)) {
+      pushResult(result);
+      const docIndex = docs.findIndex(doc => doc.source === result.source && doc.text === result.text);
+      if (docIndex === -1) continue;
+
+      for (const neighborIndex of [docIndex - 1, docIndex + 1]) {
+        const neighbor = docs[neighborIndex];
+        if (!neighbor || neighbor.source !== result.source) continue;
+        pushResult({
+          text: neighbor.text,
+          source: neighbor.source,
+          score: Math.max(0, result.score - 0.01),
+        });
+      }
+    }
+
+    for (const result of kbResults) pushResult(result);
+
+    return ordered.slice(0, 8);
+  }
+
+  /** @private */
+  _looksLikeDocumentQuery(userMessage) {
+    return /(fund|factsheet|holding|holdings|portfolio|constituents?|scheme|mutual\s+fund|pdf|document|brochure|prospectus|top\s+stocks?)/i.test(userMessage || '') ||
+      /(फंड|होल्डिंग|पोर्टफोलियो|दस्तावेज|पीडीएफ|स्कीम|स्टॉक)/.test(userMessage || '');
+  }
+
   /**
    * Generate a response for a user message.
    * @param {string} userMessage
@@ -208,7 +311,11 @@ class AIService {
     const activeVectorStore = (tenant && this.tenantVectorStores[tenant.id])
       ? this.tenantVectorStores[tenant.id]
       : this.vectorStore;
-    const kbResults = activeVectorStore.search(processedMessage, 3);
+    const looksLikeDocumentQuery = this._looksLikeDocumentQuery(processedMessage);
+    let kbResults = this._searchKnowledgeBase(activeVectorStore, processedMessage, lang);
+    if (looksLikeDocumentQuery) {
+      kbResults = this._expandKbNeighborhood(activeVectorStore, kbResults);
+    }
     let kbContext = '';
 
     if (kbResults.length > 0) {
@@ -296,6 +403,21 @@ class AIService {
         if (hasTools) {
           // Use pre-computed intent-filtered tools, then apply tenant scope
           let scopedToolDefs = intentFilteredTools.toolDefs;
+
+          // If the KB already has relevant document chunks, keep factsheet/manual/PDF
+          // questions on the KB path. Otherwise the model tends to invent SQL table
+          // names from document titles and route document Q&A through the DB agent.
+          if (hasKB && looksLikeDocumentQuery) {
+            const dbToolNames = new Set([
+              'list_tables',
+              'describe_table',
+              'get_full_schema',
+              'query_database',
+              'query_all_tables',
+              'execute_database',
+            ]);
+            scopedToolDefs = scopedToolDefs.filter(tool => !dbToolNames.has(tool.function?.name));
+          }
 
           // Apply tenant-level filtering on top of intent-based filtering
           if (tenant && this.tenantManager) {

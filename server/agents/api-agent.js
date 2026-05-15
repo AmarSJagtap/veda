@@ -22,9 +22,15 @@
 class ApiAgent {
   /**
    * @param {object[]} apiConfigs — array of API tool configs
+   * @param {object}   groups     — group enable/disable flags from agent-config.json
    */
-  constructor(apiConfigs = []) {
-    this.apis = apiConfigs;
+  constructor(apiConfigs = [], groups = {}) {
+    // Filter out any API whose _group is explicitly disabled
+    this.apis = apiConfigs.filter(api => {
+      if (!api._group) return true;
+      const grp = groups[api._group];
+      return !grp || grp.enabled !== false;
+    });
   }
 
   /**

@@ -92,7 +92,7 @@ async function initServices() {
 
   // Register API Agent
   if (agentConfig.apis?.length > 0) {
-    const apiAgent = new ApiAgent(agentConfig.apis);
+    const apiAgent = new ApiAgent(agentConfig.apis, agentConfig.groups || {});
     agentManager.registerAgent(apiAgent);
     console.log(`   🌐  API Agent: ${agentConfig.apis.length} API(s) configured`);
   }
