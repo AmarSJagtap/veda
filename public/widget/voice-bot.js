@@ -5108,10 +5108,33 @@
         }
       };
 
-      // Start listening for wake word after a short delay (let page load)
-      setTimeout(() => {
-        this.wakeWordDetector.start();
-      }, 1500);
+      // Browsers often reject SpeechRecognition started on page load because
+      // there has been no user gesture yet. Defer wake-word startup until the
+      // first interaction so manual listening is not poisoned by an early deny.
+      this._armWakeWordStart();
+    }
+
+    _armWakeWordStart() {
+      if (!this.wakeWordDetector || this._wakeWordStartArmed) return;
+
+      this._wakeWordStartArmed = true;
+
+      const startWakeWord = () => {
+        window.removeEventListener('pointerdown', startWakeWord, true);
+        window.removeEventListener('keydown', startWakeWord, true);
+        this._wakeWordStartArmed = false;
+
+        if (this.isOpen || this.miniOrbActive || !this.wakeWordDetector) return;
+
+        setTimeout(() => {
+          if (!this.isOpen && !this.miniOrbActive && this.wakeWordDetector && !this.wakeWordDetector.isRunning) {
+            this.wakeWordDetector.start();
+          }
+        }, 150);
+      };
+
+      window.addEventListener('pointerdown', startWakeWord, true);
+      window.addEventListener('keydown', startWakeWord, true);
     }
 
     /* ── Chart.js CDN Loader ── */
