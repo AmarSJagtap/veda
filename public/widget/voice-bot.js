@@ -2479,6 +2479,10 @@
       this.recognition.continuous = true;
       this.recognition.maxAlternatives = 1;
 
+      this.recognition.onstart = () => {
+        console.log('[SpeechEngine] Recognition started, lang:', this.lang);
+      };
+
       this.recognition.onresult = (e) => {
         let final = '', interim = '';
         for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -2486,6 +2490,7 @@
           if (e.results[i].isFinal) final += transcript;
           else interim += transcript;
         }
+        console.log('[SpeechEngine] Result — interim:', interim, '| final:', final);
         if (interim) this.onInterim(interim);
         if (final) {
           this.onResult(final.trim());
@@ -2494,6 +2499,7 @@
       };
 
       this.recognition.onerror = (e) => {
+        console.warn('[SpeechEngine] Recognition error (all):', e.error);
         if (e.error === 'no-speech' || e.error === 'aborted') return;
         console.warn('[SpeechEngine] Recognition error:', e.error);
 
