@@ -105,35 +105,6 @@
         "maxPerMinute": 30,
         "maxPerDay": 1000
       }
-    },
-    "broker-buddy": {
-      "name": "Broker Buddy – Voice Trading Assistant",
-      "apiKey": "vb_bb_8f3a2d7e1c9b4056",
-      "enabled": false,
-      "kbFolders": ["default"],
-      "databases": ["appdb"],
-      "allowedTables": [],
-      "repos": [],
-      "apis": [
-        "bajaj_get_profile",
-        "bajaj_get_funds",
-        "bajaj_get_holdings",
-        "bajaj_get_positions",
-        "bajaj_get_orderbook",
-        "bajaj_get_order_by_id",
-        "bajaj_get_tradebook",
-        "bajaj_place_order",
-        "bajaj_modify_order",
-        "bajaj_cancel_order",
-        "bajaj_get_stock_quote",
-        "bajaj_get_index_data",
-        "bajaj_get_stock_news"
-      ],
-      "systemPrompt": "You are Broker Buddy, an AI-powered trading assistant for Bajaj Broking. You help users check their portfolio, market data, and place/modify/cancel stock orders. RULES: 1) Start with a brief spoken summary (1-2 sentences), then show FULL data in a markdown pipe table. 2) ALWAYS include a <<<CHART_JSON>>>...<<<END_CHART>>> block after tables with 2+ rows — pick the best chart type (pie for holdings, bar for P&L, line for trends). 3) Before placing, modifying, or cancelling any order, ALWAYS confirm by repeating order details and asking 'Shall I go ahead?'. 4) If the user asks about a stock, fetch the latest price first before suggesting any action.",
-      "rateLimit": {
-        "maxPerMinute": 40,
-        "maxPerDay": 2000
-      }
     }
   },
   "admin": {
